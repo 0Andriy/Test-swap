@@ -1,70 +1,128 @@
 /**
  * @file cache.middleware.js
  * @description 
- * Інтерцептор для кешування результатів HTTP-запитів (переважно GET) у пам'яті.
- * Підтримує час життя запису (TTL), ручне інвалідовування та можливість 
- * пропуску кешу для конкретного запиту через `{ cache: false }` або `{ forceRefresh: true }`.
+ * Інтерцептор для кешування результатів HTTP-запитів у пам'яті (In-Memory).
+ * Підтримує:
+ * - Канонічну нормалізацію (сортування) Query-параметрів.
+ * - Стабілізовану серіалізацію тіла запиту (Stable JSON Stringify) для методів на кшталт QUERY / POST.
+ * - Час життя запису (TTL).
+ * - Гнучке керування на рівні запиту (вимкнення або примусове оновлення forceRefresh).
  */
 
 /**
  * Стандартне сховище кешу в пам'яті (In-Memory Map).
- * Зберігає пари: ключ -> { data, clonedResponse, expiresAt }
+ * Зберігає пари: ключ -> { response, expiresAt }
+ * @type {Map<string, { response: Response, expiresAt: number }>}
  */
 const defaultMemoryCache = new Map()
 
 /**
- * Створює унікальний ключ кешу на основі URL та опцій запиту.
+ * Рекурсивно сортує ключі об'єкта для створення стабільного JSON-рядка (Canonical JSON).
+ * Гарантує, що { b: 2, a: 1 } і { a: 1, b: 2 } дадуть ідентичний ключ для кешу,
+ * що особливо важливо для складних пошукових запитів та методів QUERY.
+ * 
+ * @param {any} value - Значення для нормалізації.
+ * @returns {string} Стабільний JSON-рядок.
+ */
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value)
+    }
+
+    if (Array.isArray(value)) {
+        return '[' + value.map(stableStringify).join(',') + ']'
+    }
+
+    const keys = Object.keys(value).sort()
+    const sortedObj = {}
+    
+    for (const key of keys) {
+        sortedObj[key] = value[key]
+    }
+
+    return JSON.stringify(sortedObj, (key, val) => {
+        if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+            const sortedNestedKeys = Object.keys(val).sort()
+            const result = {}
+            for (const k of sortedNestedKeys) {
+                result[k] = val[k]
+            }
+            return result
+        }
+        return val
+    })
+}
+
+/**
+ * Створює канонічний (нормалізований) ключ кешу.
+ * Враховує HTTP-метод, шлях, заголовки авторизації, відсортовані query-параметри 
+ * та нормалізоване тіло запиту (body).
  * 
  * @param {string} url - URL-адреса запиту.
  * @param {Object} [options={}] - Опції запиту.
- * @returns {string} Хеш-ключ для сховища.
+ * @returns {string} Унікальний та стабільний ключ кешу.
  */
 function generateCacheKey(url, options = {}) {
-    // Враховуємо метод та заголовки (наприклад, якщо Authorization різний для різних юзерів)
     const method = (options.method || 'GET').toUpperCase()
     const authHeader = options.headers?.Authorization || options.headers?.authorization || ''
     
-    return `${method}:${url}:${authHeader}`
+    let canonicalBody = ''
+    if (options.body) {
+        try {
+            const parsedBody = typeof options.body === 'string' ? JSON.parse(options.body) : options.body
+            canonicalBody = stableStringify(parsedBody)
+        } catch {
+            // Fallback для не-JSON тіла (наприклад, FormData або масиви байтів)
+            canonicalBody = String(options.body)
+        }
+    }
+
+    try {
+        const isAbsolute = url.includes('://') || url.startsWith('//')
+        const urlObj = new URL(url, isAbsolute ? undefined : 'http://localhost')
+
+        // Сортуємо query-параметри за алфавітом, усуваючи залежність від порядку їх передачі
+        urlObj.searchParams.sort()
+
+        const canonicalPath = urlObj.pathname + urlObj.search
+
+        return `${method}:${canonicalPath}:${authHeader}:${canonicalBody}`
+    } catch {
+        return `${method}:${url}:${authHeader}:${canonicalBody}`
+    }
 }
 
 /**
- * Створює клонований об'єкт Response.
- * Оскільки в Fetch API тіло відповіді (`body`) можна прочитати лише один раз, 
- * ми клонуємо Response перед збереженням у кеш, щоб і оригінальний запит, 
- * і наступні зкешовані запити могли успішно прочитати дані (наприклад, .json()).
+ * Клонує об'єкт Response. 
+ * Необхідно, оскільки тіло Response у Fetch API можна прочитати лише один раз.
  * 
- * @param {Response} response - Оригінальний об'єкт відповіді.
- * @returns {Promise<Response>} Клонований об'єкт відповіді.
+ * @param {Response} response - Оригінальна відповідь.
+ * @returns {Promise<Response>} Клонована відповідь.
  */
 async function cloneResponse(response) {
-    const cloned = response.clone()
-    return cloned
+    return response.clone()
 }
 
 /**
- * Створює параметризований мідлвар кешування.
+ * Створює параметризований мідлвар кешування (Фабрика).
  * 
  * @param {Object} [globalConfig={}] - Глобальні налаштування кешу.
  * @param {Map|Object} [globalConfig.storage=defaultMemoryCache] - Сховище для кешу.
  * @param {number} [globalConfig.ttl=60000] - Час життя кешу за замовчуванням у мілісекундах (дефолт: 1 хвилина).
- * @param {string[]} [globalConfig.methods=['GET']] - HTTP-методи, які дозволено кешувати.
+ * @param {string[]} [globalConfig.methods=['GET', 'QUERY']] - HTTP-методи, які дозволено кешувати.
  * @returns {import('../HttpClient.js').MiddlewareFunction} Налаштована функція мідлвара.
  * 
  * @example
  * client.use(createCacheMiddleware({
- *     ttl: 30000 // Кешувати всі GET запити на 30 секунд
+ *     ttl: 30000,
+ *     methods: ['GET', 'QUERY']
  * }));
- * 
- * // Використання на рівні запиту з примусовим оновленням:
- * client.get('/profile', { cache: { forceRefresh: true } });
- * // Або повне вимкнення кешу для запиту:
- * client.get('/live-data', { cache: false });
  */
 export function createCacheMiddleware(globalConfig = {}) {
     const {
         storage = defaultMemoryCache,
         ttl = 60000, // 1 хвилина за замовчуванням
-        methods = ['GET'],
+        methods = ['GET', 'QUERY'],
     } = globalConfig
 
     return async function cacheMiddleware(context, next) {
@@ -74,7 +132,7 @@ export function createCacheMiddleware(globalConfig = {}) {
 
         const method = (options.method || 'GET').toUpperCase()
 
-        // 1. Ранній вихід: якщо метод не входить у список кешованих або кешування вимкнено локально
+        // 1. Ранній вихід: якщо метод не кешується або кешування вимкнено локально ({ cache: false })
         if (!methods.includes(method) || options.cache === false) {
             delete options.cache
             return next()
@@ -87,33 +145,30 @@ export function createCacheMiddleware(globalConfig = {}) {
 
         const cacheKey = generateCacheKey(context.url, options)
 
-        // 2. Перевірка наявності валідного кешу (якщо не вимагається примусове оновлення)
+        // 2. Перевірка наявності валідного запису в кеші (якщо не вимагається примусове оновлення)
         if (!forceRefresh && storage.has(cacheKey)) {
             const cachedItem = storage.get(cacheKey)
 
-            // Перевіряємо, чи не минув час життя (TTL)
             if (Date.now() < cachedItem.expiresAt) {
-                logger?.debug?.('[CacheMiddleware] 🎯 Знайдено актуальний кеш для:', context.url)
+                logger?.debug?.(`[CacheMiddleware] 🎯 [Cache Hit] Знайдено актуальний кеш для ${method} ${context.url}`)
                 
-                // Повертаємо клоновану копію зкешованої відповіді
                 delete options.cache
+                // Повертаємо клоновану копію зкешованої відповіді
                 return cachedItem.response.clone()
             } else {
-                // Час життя вийшов — видаляємо застарілий запис
-                logger?.debug?.('[CacheMiddleware] ⌛ Час життя кешу (TTL) вичерпано для:', context.url)
+                logger?.debug?.(`[CacheMiddleware] ⌛ Час життя кешу (TTL) вичерпано для ${context.url}`)
                 storage.delete(cacheKey)
             }
         }
 
-        // 3. Виконуємо реальний мережевий запит, оскільки кешу немає або він застарів
-        logger?.debug?.('[CacheMiddleware] 🌐 Виконуємо мережевий запит (кеш відсутній):', context.url)
-        
+        logger?.debug?.(`[CacheMiddleware] 🌐 [Cache Miss] Виконуємо мережевий запит для ${method} ${context.url}`)
+
+        // 3. Виконуємо реальний запит далі по ланцюжку
         const response = await next()
 
         // Кешуємо лише успішні відповіді (статус 200-299)
         if (response && response.ok) {
             try {
-                // Клонуємо відповідь перед збереженням
                 const responseToCache = await cloneResponse(response)
                 
                 storage.set(cacheKey, {
@@ -121,9 +176,9 @@ export function createCacheMiddleware(globalConfig = {}) {
                     expiresAt: Date.now() + currentTtl,
                 })
 
-                logger?.debug?.(`[CacheMiddleware] 💾 Успішно зкешовано відповідь для ${context.url} на ${currentTtl}мс`)
+                logger?.debug?.(`[CacheMiddleware] 💾 Успішно збережено в кеш на ${currentTtl}мс`)
             } catch (cacheError) {
-                logger?.error?.('[CacheMiddleware] Помилка при спробі зберегти відповідь у кеш:', cacheError.message)
+                logger?.error?.(`[CacheMiddleware] Помилка збереження в кеш: ${cacheError.message}`)
             }
         }
 
